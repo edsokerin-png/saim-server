@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -49,6 +49,7 @@ class Manager:
         self.cleanup_old_clients(ip, client_id)
 
     def cleanup_old_clients(self, ip, keep_id):
+        """Удаляет все записи с тем же IP, кроме текущего."""
         try:
             con = sqlite3.connect(DB)
             cur = con.cursor()
@@ -56,7 +57,22 @@ class Manager:
             con.commit()
             con.close()
         except Exception as e:
-            print(f"cleanup error: {e}")
+            print(f"cleanup_old_clients error: {e}")
+
+    def cleanup_dead_clients(self):
+        """Удаляет записи, которые offline больше 1 дня."""
+        try:
+            cutoff = (datetime.now() - timedelta(days=1)).isoformat()
+            con = sqlite3.connect(DB)
+            cur = con.cursor()
+            cur.execute("DELETE FROM clients WHERE status='offline' AND last_seen < ?", (cutoff,))
+            deleted = cur.rowcount
+            con.commit()
+            con.close()
+            if deleted > 0:
+                print(f"cleanup_dead_clients: удалено {deleted} старых записей")
+        except Exception as e:
+            print(f"cleanup_dead_clients error: {e}")
 
     async def connect_admin(self, ws):
         self.admins.add(ws)
@@ -118,12 +134,20 @@ class Manager:
         return False
 
     def list_clients(self):
+        """Возвращает список клиентов с РЕАЛЬНЫМ статусом."""
         con = sqlite3.connect(DB)
         cur = con.cursor()
         cur.execute("SELECT id, ip, last_seen, status, model, battery, temp, net FROM clients")
         rows = cur.fetchall()
         con.close()
-        return rows
+        result = []
+        for row in rows:
+            client_id = row[0]
+            # Если сокет открыт — online, иначе offline (не важно что в базе)
+            real_status = "online" if client_id in self.clients else "offline"
+            result.append((row[0], row[1], row[2], real_status,
+                           row[4], row[5], row[6], row[7]))
+        return result
 
 
 manager = Manager()
@@ -131,9 +155,10 @@ manager = Manager()
 
 async def self_ping():
     if not RENDER_URL:
+        print("RENDER_EXTERNAL_URL не задан — self-ping отключён")
         return
     ping_url = RENDER_URL.rstrip("/") + "/health"
-    print(f"Self-ping: {ping_url}")
+    print(f"Self-ping запущен: {ping_url} каждые {PING_INTERVAL} сек")
     async with httpx.AsyncClient() as client:
         while True:
             try:
@@ -147,6 +172,7 @@ async def self_ping():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(self_ping())
+    manager.cleanup_dead_clients()
 
 
 @app.get("/health")
@@ -210,6 +236,7 @@ async def client_ws(ws: WebSocket, client_id: str):
 async def admin_ws(ws: WebSocket):
     await ws.accept()
     await manager.connect_admin(ws)
+    manager.cleanup_dead_clients()
     await ws.send_text(json.dumps({
         "type": "clients_list", "clients": manager.list_clients(),
     }))
@@ -221,7 +248,6 @@ async def admin_ws(ws: WebSocket):
             except Exception:
                 continue
 
-            # Обработка запроса списка клиентов
             if msg.get("type") == "get_clients":
                 await ws.send_text(json.dumps({
                     "type": "clients_list",
