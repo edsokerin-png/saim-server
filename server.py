@@ -134,7 +134,7 @@ class Manager:
         return False
 
     def list_clients(self):
-        """Возвращает список клиентов с РЕАЛЬНЫМ статусом."""
+        """Возвращает ТОЛЬКО онлайн-клиентов (у кого открыт сокет)."""
         con = sqlite3.connect(DB)
         cur = con.cursor()
         cur.execute("SELECT id, ip, last_seen, status, model, battery, temp, net FROM clients")
@@ -143,10 +143,10 @@ class Manager:
         result = []
         for row in rows:
             client_id = row[0]
-            # Если сокет открыт — online, иначе offline (не важно что в базе)
-            real_status = "online" if client_id in self.clients else "offline"
-            result.append((row[0], row[1], row[2], real_status,
-                           row[4], row[5], row[6], row[7]))
+            # Показываем только тех, у кого реально открыт сокет
+            if client_id in self.clients:
+                result.append((row[0], row[1], row[2], "online",
+                               row[4], row[5], row[6], row[7]))
         return result
 
 
@@ -188,6 +188,15 @@ async def client_ws(ws: WebSocket, client_id: str):
     await manager.broadcast_to_admins({
         "type": "client_connected", "client_id": client_id, "ip": ip,
     })
+    # Обновляем список у всех админов
+    for admin in list(manager.admins):
+        try:
+            await admin.send_text(json.dumps({
+                "type": "clients_list", "clients": manager.list_clients(),
+            }))
+        except Exception:
+            pass
+
     try:
         while True:
             text = await ws.receive_text()
@@ -230,6 +239,14 @@ async def client_ws(ws: WebSocket, client_id: str):
         await manager.broadcast_to_admins({
             "type": "client_disconnected", "client_id": client_id,
         })
+        # Обновляем список у всех админов — клиент отключился
+        for admin in list(manager.admins):
+            try:
+                await admin.send_text(json.dumps({
+                    "type": "clients_list", "clients": manager.list_clients(),
+                }))
+            except Exception:
+                pass
 
 
 @app.websocket("/ws/admin")
