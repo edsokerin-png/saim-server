@@ -17,6 +17,7 @@ RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PING_INTERVAL = 14 * 60
 
 
+# ---------- База данных ----------
 def init_db():
     con = sqlite3.connect(DB)
     cur = con.cursor()
@@ -45,6 +46,7 @@ def init_db():
 init_db()
 
 
+# ---------- Менеджер подключений ----------
 class Manager:
     def __init__(self):
         self.clients = {}
@@ -53,6 +55,20 @@ class Manager:
     async def connect_client(self, client_id, ws, ip):
         self.clients[client_id] = ws
         self.update_client(client_id, ip, status="online")
+        # Удаляем другие устройства с тем же IP, кроме текущего
+        self.cleanup_old_clients(ip, client_id)
+
+    def cleanup_old_clients(self, ip, keep_id):
+        """Удаляет все записи с этим IP, кроме keep_id."""
+        try:
+            con = sqlite3.connect(DB)
+            cur = con.cursor()
+            cur.execute("DELETE FROM clients WHERE ip=? AND id!=?", (ip, keep_id))
+            con.commit()
+            con.close()
+            print(f"Удалены старые устройства с IP {ip}")
+        except Exception as e:
+            print(f"cleanup_old_clients error: {e}")
 
     async def connect_admin(self, ws):
         self.admins.add(ws)
@@ -116,6 +132,7 @@ class Manager:
 manager = Manager()
 
 
+# ---------- Self-ping для Render ----------
 async def self_ping():
     if not RENDER_URL:
         print("RENDER_EXTERNAL_URL не задан — self-ping отключён")
@@ -142,6 +159,7 @@ async def health():
     return {"ok": True, "time": int(datetime.now().timestamp() * 1000)}
 
 
+# ---------- WebSocket: клиент ----------
 @app.websocket("/ws/client/{client_id}")
 async def client_ws(ws: WebSocket, client_id: str):
     await ws.accept()
@@ -161,8 +179,10 @@ async def client_ws(ws: WebSocket, client_id: str):
                 msg = json.loads(text)
             except Exception:
                 msg = {"raw": text}
+
             msg["client_id"] = client_id
             msg["ts"] = datetime.now().isoformat()
+
             await manager.broadcast_to_admins({
                 "type": "client_message",
                 "payload": msg,
@@ -175,11 +195,13 @@ async def client_ws(ws: WebSocket, client_id: str):
         })
 
 
+# ---------- WebSocket: админка ----------
 @app.websocket("/ws/admin")
 async def admin_ws(ws: WebSocket):
     await ws.accept()
     await manager.connect_admin(ws)
 
+    # Отправляем текущий список клиентов
     await ws.send_text(json.dumps({
         "type": "clients_list",
         "clients": manager.list_clients(),
@@ -192,6 +214,7 @@ async def admin_ws(ws: WebSocket):
                 msg = json.loads(text)
             except Exception:
                 continue
+
             if msg.get("type") == "command":
                 client_id = msg.get("client_id")
                 command = msg.get("command")
@@ -224,20 +247,25 @@ async def admin_ws(ws: WebSocket):
         manager.disconnect_admin(ws)
 
 
+# ---------- Корень ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return """
 <!DOCTYPE html>
 <html lang="ru">
-<head><meta charset="utf-8"><title>saim Server</title>
+<head>
+<meta charset="utf-8">
+<title>saim Server</title>
 <style>
 body { background:#2A2A2A; color:#fff; font-family: monospace; padding:20px; }
 table { border-collapse: collapse; width:100%; }
 td, th { border:1px solid #555; padding:8px; }
-</style></head>
+h1 { color:#fff; }
+</style>
+</head>
 <body>
 <h1>saim Server — ONLINE</h1>
-<p>Сервер работает.</p>
+<p>Сервер работает. Self-ping активен каждые 14 минут.</p>
 <h2>Клиенты</h2>
 <table id="clients">
 <tr><th>ID</th><th>IP</th><th>Last seen</th><th>Status</th></tr>
@@ -262,6 +290,7 @@ ws.onmessage = (e) => {
 """
 
 
+# ---------- Запуск ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
