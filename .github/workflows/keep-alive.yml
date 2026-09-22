@@ -13,4 +13,4 @@ jobs:
         run: |
           echo "Pinging server..."
           curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://saim-server.onrender.com/health
-          echo "Done at $(date -u)
+          echo "Done at $(date -u)"
