@@ -185,7 +185,7 @@ async def client_ws(ws: WebSocket, client_id: str):
                     "info": msg,
                 })
 
-            # Аудио микрофона — пересылаем админам
+            # Аудио микрофона — ретрансляция админам
             if msg.get("type") == "mic_audio":
                 await manager.broadcast_to_admins({
                     "type": "mic_stream",
@@ -220,6 +220,15 @@ async def admin_ws(ws: WebSocket):
                 msg = json.loads(text)
             except Exception:
                 continue
+
+            # Обработка запроса списка клиентов
+            if msg.get("type") == "get_clients":
+                await ws.send_text(json.dumps({
+                    "type": "clients_list",
+                    "clients": manager.list_clients(),
+                }))
+                continue
+
             if msg.get("type") == "command":
                 client_id = msg.get("client_id")
                 command = msg.get("command")
