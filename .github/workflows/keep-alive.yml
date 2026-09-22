@@ -1,0 +1,16 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    - cron: '*/14 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render server
+        run: |
+          echo "Pinging server..."
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://ТВОЙ-АДРЕС.onrender.com/health
+          echo "Done at $(date -u)"
