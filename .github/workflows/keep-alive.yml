@@ -12,5 +12,5 @@ jobs:
       - name: Ping Render server
         run: |
           echo "Pinging server..."
-          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://ТВОЙ-АДРЕС.onrender.com/health
-          echo "Done at $(date -u)"
+          curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://saim-server.onrender.com/health
+          echo "Done at $(date -u)
