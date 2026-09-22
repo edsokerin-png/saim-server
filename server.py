@@ -185,6 +185,15 @@ async def client_ws(ws: WebSocket, client_id: str):
                     "info": msg,
                 })
 
+            # Аудио микрофона — пересылаем админам
+            if msg.get("type") == "mic_audio":
+                await manager.broadcast_to_admins({
+                    "type": "mic_stream",
+                    "client_id": client_id,
+                    "data": msg.get("data", ""),
+                })
+                continue
+
             msg["client_id"] = client_id
             msg["ts"] = datetime.now().isoformat()
             await manager.broadcast_to_admins({
