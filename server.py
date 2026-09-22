@@ -162,6 +162,20 @@ async def health():
     return {"ok": True, "time": int(datetime.now().timestamp() * 1000)}
 
 
+@app.get("/reset")
+async def reset_db():
+    """Удаляет все записи из базы."""
+    try:
+        con = sqlite3.connect(DB)
+        cur = con.cursor()
+        cur.execute("DELETE FROM clients")
+        con.commit()
+        con.close()
+        return {"ok": True, "message": "База очищена"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.websocket("/ws/client/{client_id}")
 async def client_ws(ws: WebSocket, client_id: str):
     await ws.accept()
